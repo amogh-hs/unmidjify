@@ -1,6 +1,6 @@
 # unmidjify
 
-FIXME: description
+A Clojure tool that helps in converting a Midje based test codebase to a clojure.test based codebase.
 
 ## Installation
 
@@ -8,9 +8,11 @@ Download from http://example.com/FIXME.
 
 ## Usage
 
-FIXME: explanation
+In the REPl,
 
-    $ java -jar unmidjify-0.1.0-standalone.jar [args]
+(require 'unmidjify.core),
+
+(unmidjify <path/to/file/or/directory>)
 
 ## Options
 
