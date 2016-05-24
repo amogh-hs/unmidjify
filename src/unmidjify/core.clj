@@ -9,10 +9,6 @@
             [clojure.zip :as zip]
             [bultitude.core :as bultitude]))
 
-(def ^:dynamic *current-file* nil)
-(def ^:dynamic *current-ns* nil)
-
-;; Defining alternate functions that were imported from circle.util ns
 
 (defn third [lst]
   (last (take 3 lst)))
@@ -70,11 +66,10 @@
   "Resolves a form, and returns truthy if it evaluates to a fn"
   [f]
   (when (symbol? f)
-    (binding [clojure.core/*ns* (or *current-ns* clojure.core/*ns*)]
-      (let [resolved (resolve f)]
-        (and resolved (or (fn? resolved)
-                          (and (var? resolved)
-                               (fn? @resolved))))))))
+    (let [resolved (resolve f)]
+      (and resolved (or (fn? resolved)
+                        (and (var? resolved)
+                             (fn? @resolved)))))))
 
 (defn translate-normal-arrow [[f1 f2 f3]]
   (match [f1 f2 f3]
@@ -125,36 +120,12 @@
         (recur (conj ret (first lst)) (rest lst)))
       (list! ret))))
 
-(defn require-ns
-  "Total hack to make sure the ns form is already evaluated, so we can resolve fns later"
-  [form]
-  (when (and (list? form)
-             (= 'ns (first form)))
-    (binding [clojure.core/*ns* clojure.core/*ns*]
-      ;; don't let the ns form stomp on our current ns
-      (eval form)))
-  form)
-
 (defn remove-expect [form]
   (if (and (list? form) (= 'expect (first form)))
     (do
       (assert (= 2 (count form)))
       (second form))
     form))
-
-(defn replace-setup-test-dbs [form]
-  (cond
-   (contains? #{'(test/setup-test-dbs)
-                '(setup-test-dbs)
-                '(test/test-ns-setup)
-                '(test-ns-setup)} form) '(test/test-fixtures)
-    (and (list? form)
-         (= 'test/midje-fixtures (first form))) `(test/test-fixtures ~@(rest form))
-         (and (list? form)
-         (= 'wd/setup-tests (first form))) `(wd/webdriver-fixtures ~@(rest form))
-    (and (list? form)
-         (= 'webdriver/setup-tests (first form))) `(webdriver/webdriver-fixtures ~@(rest form))
-    :else form))
 
 (defn munge-name [name]
   (-> name
@@ -185,11 +156,6 @@
     'clojure.test
     form))
 
-(defn replace-future-fact [form]
-  (if (= 'future-fact (first form))
-    `(~'comment ~(replace-fact `(~'fact ~@(rest form))))
-    form))
-
 (defn cast-coll
   "Convert one seq class into another. Use it to handle (into (empty list) '(1 2 3)) being dumb"
   [cls form]
@@ -199,14 +165,12 @@
 
 (defn munge-form [form]
   (let [form (-> form
-                 (replace-setup-test-dbs)
                  (replace-midje-sweet))
         form-class (class form)]
     (cond
      (or (list? form)
          (vector? form)) (-> form
                              (replace-fact)
-                             (replace-future-fact)
                              (replace-arrow)
                              (remove-expect)
                              (->> (map #(munge-form %))
@@ -219,19 +183,83 @@
 (defn read-seq [s]
   (read-string (str "(" s  "\n)")))
 
+(defn ns-state-change-form?
+  [form]
+  (= 'namespace-state-changes
+     (first form)))
+
+(defn get-ns-forms [forms]
+  (filter
+   ns-state-change-form?
+   forms))
+
+(defn without-ns-forms [forms]
+  (remove
+   ns-state-change-form?
+   forms))
+
+(defn extract-ns-vectors
+  [ns-forms]
+  (map
+   (fn [ns-form]
+    (last ns-form))
+   ns-forms))
+
+(defn get-fixture-map
+  [ns-forms]
+  (reduce
+   (fn [fixture-map curr-form]
+     (assoc fixture-map (nth curr-form 0) (nth curr-form 2)))
+   {}
+   ns-forms))
+
+(defn define-once-fixture
+  [fixture-map]
+  (let [fixture-code '(defn once-fixture [tests]
+                        :before
+                        (tests)
+                        :after)]
+    (replace {:before (fixture-map 'before) 
+              :after (fixture-map 'after)} fixture-code)))
+
+(defn define-each-fixture
+  [fixture-map]
+  (let [fixture-code '(defn each-fixture [tests])]
+    (concat
+     fixture-code
+     [(clojure.walk/postwalk-replace {'?form '(tests)} (fixture-map 'around))])))
+
+(defn add-fixture-code
+  [forms & fixture-code]
+  (concat (list (first forms))
+          fixture-code
+          (rest forms)))
+
+
+(defn replace-ns-state-changes
+  [forms]
+  (let [fixture-map (->> forms
+                         (get-ns-forms)
+                         (extract-ns-vectors)
+                         (apply concat)
+                         (get-fixture-map))]
+    (-> forms
+      (without-ns-forms)
+      (add-fixture-code
+       (define-once-fixture fixture-map)
+       (define-each-fixture fixture-map)
+       '(use-fixtures :once  once-fixture)
+       '(use-fixtures :each  each-fixture)))))
+
+
 (defn transform [file]
   (-> file
       slurp
       (read-seq)
       (list!)
       (walk)
+      (replace-ns-state-changes)
       (format-for-file)))
-
-;;(->> (spit file)
-
-(defn successful-test-results? [results]
-  (and (-> results :error zero?)
-       (-> results :fail zero?)))
 
 (defn midje? [file]
   (or (re-find #"midje.sweet" (slurp file))
@@ -267,7 +295,7 @@
   corresponding clojure.test semantics."
   [path]
   (if-not (.exists (io/file path))
-    (println (str path "No such file or directory"))
+    (println (str path " : No such file or directory"))
     (if (.isDirectory (io/file path))
       (unmidjify-dir path)
-      (unmidjify-file path))))
+      (unmidjify-file (java.io.File. path)))))
