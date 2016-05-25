@@ -235,7 +235,6 @@
           fixture-code
           (rest forms)))
 
-
 (defn replace-ns-state-changes
   [forms]
   (let [fixture-map (->> forms
@@ -252,10 +251,22 @@
        '(use-fixtures :each  each-fixture)))))
 
 
+(defn remove-facts
+  [form-list]
+  (let [facts? #(= (first %) 'facts)
+        all-facts (filter facts? form-list)
+        all-facts-content-forms (apply concat (map #(drop 2 %) all-facts))]
+    (seq
+     (concat
+      (remove facts? form-list)
+      all-facts-content-forms))))
+
+
 (defn transform [file]
   (-> file
       slurp
       (read-seq)
+      (remove-facts)
       (list!)
       (walk)
       (replace-ns-state-changes)
