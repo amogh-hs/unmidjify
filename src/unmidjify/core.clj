@@ -150,6 +150,11 @@
     'clojure.test
     form))
 
+(defn replace-future-fact [form]
+  (if (= 'future-fact (first form))
+    `(~'comment ~(replace-fact `(~'fact ~@(rest form))))
+    form))
+
 (defn cast-coll
   "Convert one seq class into another. Use it to handle (into (empty list) '(1 2 3)) being dumb"
   [cls form]
@@ -197,7 +202,9 @@
 (defn fact-in-let?
   [form]
   (and (= (first form) 'let)
-   (some #(and (list? %) (= (first %) 'fact)) (drop 2 form))))
+       (some #(and (list? %)
+                   (= (first %) 'fact))
+             (drop 2 form))))
 
 
 (defn fact-forms-wrapped-let
@@ -216,6 +223,7 @@
      (or (list? form)
          (vector? form)) (-> form
                              (replace-fact)
+                             (replace-future-fact)
                              (replace-arrow)
                              (->> (map #(munge-form % opts))
                                   (cast-coll form-class)))
@@ -387,7 +395,7 @@
 (defn- backup-copy-name [f]
   (str 
    (.getParent f)
-   "/_cljtest_/"
+   "/cljtest/"
    (.getName f)))
 
 (defn- new-source-file [f content]
