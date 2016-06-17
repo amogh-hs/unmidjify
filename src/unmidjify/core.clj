@@ -120,13 +120,6 @@
         (recur (conj ret (first lst)) (rest lst)))
       (list! ret))))
 
-(defn remove-expect [form]
-  (if (and (list? form) (= 'expect (first form)))
-    (do
-      (assert (= 2 (count form)))
-      (second form))
-    form))
-
 (defn munge-name [name]
   (-> name
       (str/replace " " "-")
@@ -142,6 +135,7 @@
       (str/replace #"^(\d+)" "_$1")
       (str/replace #"^:" "")
       (str/replace #"-+" "-")))
+
 
 (defn replace-fact
   "If the form is (fact ...) replace w/ (deftest ...)"
@@ -163,7 +157,58 @@
     clojure.lang.PersistentList (list* form)
     clojure.lang.PersistentVector (vec form)))
 
-(defn munge-form [form]
+(defn test-relative-path
+  [absolute-path]
+  (first
+   (re-find #"/test(/.*)?$" absolute-path )))
+
+(defn file-path-excluded?
+  [excluded-paths file-path]
+  (let [relative-file-path (test-relative-path file-path)]
+    (not
+     (empty?
+      (filter
+       (fn [excluded-path]
+         (let [relative-excluded-path (test-relative-path excluded-path)]
+           (re-find (re-pattern (str "^" relative-excluded-path)) relative-file-path)))
+       excluded-paths)))))
+
+(defn wrap-fact-body-in-let [let-bindings fact-form]
+  (let [fact-content (drop 2 fact-form)]
+    (list
+     'fact
+     (nth fact-form 1)
+     (concat
+      (list 'let let-bindings)
+      fact-content))))
+
+(defn push-outer-let-in-each-fact 
+  [form]
+  (let [let-bindings (nth form 1)
+        let-body (filter
+                  #(= (first %) 'fact)
+                  (drop 2 form))
+        let-wrapped-forms (map
+                           #(wrap-fact-body-in-let let-bindings %)
+                           let-body)]
+
+    let-wrapped-forms))
+
+(defn fact-in-let?
+  [form]
+  (and (= (first form) 'let)
+   (some #(and (list? %) (= (first %) 'fact)) (drop 2 form))))
+
+
+(defn fact-forms-wrapped-let
+  [form opts]
+  (if-not (file-path-excluded? (get opts :exclude-paths #{}) (opts :file-path))
+    (push-outer-let-in-each-fact form)
+    '(form)))
+
+
+(defn munge-form [form opts]
+  ;;(update-nested-facts form opts)
   (let [form (-> form
                  (replace-midje-sweet))
         form-class (class form)]
@@ -172,13 +217,13 @@
          (vector? form)) (-> form
                              (replace-fact)
                              (replace-arrow)
-                             (remove-expect)
-                             (->> (map #(munge-form %))
+                             (->> (map #(munge-form % opts))
                                   (cast-coll form-class)))
      :else form)))
 
-(defn walk [form]
-  (munge-form form))
+
+(defn walk [form opts]
+  (munge-form form opts))
 
 (defn read-seq [s]
   (read-string (str "(" s  "\n)")))
@@ -241,59 +286,127 @@
                          (get-ns-forms)
                          (extract-ns-vectors)
                          (apply concat)
-                         (get-fixture-map))]
+                         (get-fixture-map))
+        has-ns-forms (first (filter #(= (first %) 'namespace-state-changes) forms))]
     (-> forms
-      (without-ns-forms)
-      (add-fixture-code
-       (define-once-fixture fixture-map)
-       (define-each-fixture fixture-map)
-       '(use-fixtures :once  once-fixture)
-       '(use-fixtures :each  each-fixture)))))
+         (without-ns-forms)
+         (#(if has-ns-forms
+             (add-fixture-code
+              %
+              (define-once-fixture fixture-map)
+              (define-each-fixture fixture-map)
+              '(use-fixtures :once  once-fixture)
+              '(use-fixtures :each  each-fixture))
+             %)))))
 
+(defn facts?
+  [element]
+  (and
+   (seq? element)
+   (= (first element) 'facts)))
 
-(defn remove-facts
+(defn contains-facts-form?
   [form-list]
-  (let [facts? #(= (first %) 'facts)
-        all-facts (filter facts? form-list)
-        all-facts-content-forms (apply concat (map #(drop 2 %) all-facts))]
-    (seq
-     (concat
-      (remove facts? form-list)
-      all-facts-content-forms))))
+  (first
+   (filter
+    facts?
+    form-list)))
 
+(defn facts-content
+  [facts-form]
+  (drop 2 facts-form))
 
-(defn transform [file]
+(defn replace-facts-with-content
+  [item]
+  (if (seq? item)
+    (mapcat
+     (fn [e]
+       (if (facts? e)
+         (facts-content (doall e))
+         (list e)))
+     item)
+   item))
+
+(defn open-all-facts
+  [form-list]
+  (clojure.walk/postwalk
+   replace-facts-with-content 
+   form-list))
+
+(defn unbound-let-bound-fact
+  [form-list opts]
+  (let [fact-wrapped-let (->> form-list
+                             (filter fact-in-let?)
+                             (map #(fact-forms-wrapped-let % opts))
+                             (apply concat))]
+    (->>
+     form-list
+     (remove fact-in-let?)
+     (#(concat %  fact-wrapped-let)))))
+
+(defn extract-action [action-symbol actions]
+  (last
+   (first
+    (filter
+     #(and (= (first %) action-symbol)
+           (= (nth % 1) :checks))
+     actions))))
+
+(defn with-state-changes-inside-out
+  [[form-name actions facts-form :as form]]
+  (if (= form-name 'with-state-changes)
+    (let [before-action (extract-action 'before actions)
+          after-action (extract-action 'after actions)]
+     (clojure.walk/prewalk
+      (fn [item]
+        (if (and (list? item) (= 'fact (first item)))
+          (concat (take 2 item) [before-action] (drop 2 item) [after-action])
+          item))
+      facts-form))
+    form))
+
+(defn transform [file opts]
   (-> file
       slurp
       (read-seq)
-      (remove-facts)
+      (unbound-let-bound-fact opts)
       (list!)
-      (walk)
+      (walk opts)
       (replace-ns-state-changes)
+      (#(map with-state-changes-inside-out %))
+      (open-all-facts)
       (format-for-file)))
 
 (defn midje? [file]
   (or (re-find #"midje.sweet" (slurp file))
       (re-find #"\(fact" (slurp file))))
 
+(defn original-file? [file]
+  (re-find #"cljtest" (.getAbsolutePath file)))
+
 (defn- backup-copy-name [f]
   (str 
    (.getParent f)
-   "/_cljtest_"
+   "/_cljtest_/"
    (.getName f)))
 
-(defn- unmidjify-file [f]
-  (-> f
-      transform
-      (->> (spit (backup-copy-name f)))))
+(defn- new-source-file [f content]
+  (clojure.java.io/make-parents (backup-copy-name f))
+  (spit (backup-copy-name f) content))
 
-(defn- unmidjify-dir [d]
+(defn- unmidjify-file [f opts]
+  (-> f
+      (transform (assoc opts :file-path (.getAbsolutePath f)))
+      (->> (new-source-file f))))
+
+(defn- unmidjify-dir [d opts]
   (let [files (->> (java.io.File. d)
                    (ns/find-clojure-sources-in-dir )
-                   (filter midje?))]
+                   (filter midje?)
+                   (filter original-file?))]
     (doseq [f files]
       (try
-        (unmidjify-file f)
+        (unmidjify-file f opts)
         (catch Throwable t
           (print t)
           (.printStackTrace t)
@@ -304,9 +417,16 @@
   If it is a directory then recursively looks for files containing a midje
   fact or an import for midje, sweet and replace the file(s) with their
   corresponding clojure.test semantics."
-  [path]
+  [path & {:as opts}]
   (if-not (.exists (io/file path))
     (println (str path " : No such file or directory"))
     (if (.isDirectory (io/file path))
-      (unmidjify-dir path)
-      (unmidjify-file (java.io.File. path)))))
+      (unmidjify-dir path (or opts {}))
+      (unmidjify-file (java.io.File. path) (or opts {})))))
+
+
+
+
+
+
+
