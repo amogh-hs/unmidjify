@@ -9,4 +9,4 @@ In the REPl,
 
 (require 'unmidjify.core),
 
-(unmidjify <path/to/file/or/directory>)
+(unmidjify "path/to/file/or/directory")
